@@ -1,11 +1,11 @@
 import os
 import re
 import sqlite3
+import hashlib
 from datetime import datetime, timezone
 from collections import Counter
 
 import pandas as pd
-import requests
 import streamlit as st
 
 st.set_page_config(page_title="TrendWatch X", page_icon="🌷", layout="wide")
@@ -29,23 +29,16 @@ DB_PATH = os.getenv("TRENDWATCH_DB", "trendwatch.db")
 DEFAULT_PRODUCTS = "Netflix,Canva,CapCut,Spotify,ChatGPT,YouTube,Prime Video,Vidio,Disney+"
 DEFAULT_KEYWORDS = "butuh,cari,mau beli,ada yang jual,WTB,want to buy,rekomendasi,nyari,need"
 DEFAULT_HASHTAGS = "zonauang,canva,spotify,netflix"
+STATUSES = ["Baru", "Ditindaklanjuti", "Selesai", "Perlu ditinjau"]
 
 def connect_db():
     conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
     conn.execute("""CREATE TABLE IF NOT EXISTS posts (
-        post_id TEXT PRIMARY KEY,
-        created_at TEXT,
-        username TEXT,
-        text TEXT NOT NULL,
-        likes INTEGER DEFAULT 0,
-        reposts INTEGER DEFAULT 0,
-        replies INTEGER DEFAULT 0,
-        lang TEXT,
-        matched_product TEXT,
-        matched_terms TEXT,
-        status TEXT DEFAULT 'Baru',
-        source TEXT DEFAULT 'X API',
-        imported_at TEXT
+        post_id TEXT PRIMARY KEY, created_at TEXT, username TEXT,
+        text TEXT NOT NULL, likes INTEGER DEFAULT 0, reposts INTEGER DEFAULT 0,
+        replies INTEGER DEFAULT 0, lang TEXT, matched_product TEXT,
+        matched_terms TEXT, status TEXT DEFAULT 'Baru',
+        source TEXT DEFAULT 'Input manual', imported_at TEXT
     )""")
     conn.commit()
     return conn
@@ -61,62 +54,32 @@ def match_post(text, products, keywords, hashtags):
     terms = keyword_hits + [f"#{h}" for h in hashtag_hits]
     return ", ".join(product_hits), ", ".join(dict.fromkeys(terms)), bool(product_hits and (keyword_hits or hashtag_hits))
 
-def get_token():
-    try:
-        token = st.secrets.get("X_BEARER_TOKEN", "")
-    except Exception:
-        token = ""
-    return token or os.getenv("X_BEARER_TOKEN", "")
+def load_posts():
+    conn = connect_db()
+    df = pd.read_sql_query("SELECT * FROM posts ORDER BY created_at DESC, imported_at DESC", conn)
+    conn.close()
+    return df
 
-def fetch_x(query, limit):
-    token = get_token()
-    if not token:
-        raise RuntimeError("Bearer Token belum dipasang. Ikuti README untuk mengaturnya secara rahasia.")
-    # Official X API v2 recent search. Availability and pricing depend on X account tier.
-    url = "https://api.x.com/2/tweets/search/recent"
-    params = {
-        "query": query,
-        "max_results": min(100, max(10, int(limit))),
-        "tweet.fields": "created_at,public_metrics,entities,lang,author_id",
-        "expansions": "author_id",
-        "user.fields": "username,name"
-    }
-    response = requests.get(url, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=30)
-    if response.status_code == 401:
-        raise RuntimeError("X API menolak token (401). Periksa token.")
-    if response.status_code == 403:
-        raise RuntimeError("Akses ditolak (403). Endpoint atau paket akunmu mungkin tidak mengizinkan pencarian ini.")
-    if response.status_code == 429:
-        raise RuntimeError("Kuota/batas permintaan tercapai (429). Tunggu sebelum mencoba lagi.")
-    response.raise_for_status()
-    payload = response.json()
-    users = {u["id"]: u for u in payload.get("includes", {}).get("users", [])}
-    rows = []
-    for post in payload.get("data", []):
-        user = users.get(post.get("author_id"), {})
-        metrics = post.get("public_metrics", {})
-        rows.append({
-            "post_id": post["id"],
-            "created_at": post.get("created_at", ""),
-            "username": "@" + user.get("username", "unknown"),
-            "text": post.get("text", ""),
-            "likes": metrics.get("like_count", 0),
-            "reposts": metrics.get("retweet_count", 0),
-            "replies": metrics.get("reply_count", 0),
-            "lang": post.get("lang", ""),
-            "source": "X API"
-        })
-    return rows
-
-def save_posts(rows, products, keywords, hashtags):
+def save_posts(texts, products, keywords, hashtags, source="Input manual"):
     conn = connect_db()
     added = 0
-    for row in rows:
-        product, terms, is_opportunity = match_post(row.get("text", ""), products, keywords, hashtags)
-        row["matched_product"] = product
-        row["matched_terms"] = terms
-        row["imported_at"] = datetime.now(timezone.utc).isoformat()
-        row["status"] = "Baru" if is_opportunity else "Perlu ditinjau"
+    now = datetime.now(timezone.utc).isoformat()
+    for item in texts:
+        text_value = str(item.get("text", "")).strip()
+        if not text_value:
+            continue
+        raw_id = str(item.get("post_id") or hashlib.sha256(text_value.encode("utf-8")).hexdigest())
+        post_id = raw_id if raw_id else hashlib.sha256(text_value.encode("utf-8")).hexdigest()
+        product, terms, opportunity = match_post(text_value, products, keywords, hashtags)
+        row = {
+            "post_id": post_id, "created_at": str(item.get("created_at") or now),
+            "username": str(item.get("username") or "Input manual"),
+            "text": text_value, "likes": int(item.get("likes") or 0),
+            "reposts": int(item.get("reposts") or 0), "replies": int(item.get("replies") or 0),
+            "lang": str(item.get("lang") or ""), "matched_product": product,
+            "matched_terms": terms, "status": "Baru" if opportunity else "Perlu ditinjau",
+            "source": str(item.get("source") or source), "imported_at": now
+        }
         before = conn.total_changes
         conn.execute("""INSERT OR IGNORE INTO posts
         (post_id,created_at,username,text,likes,reposts,replies,lang,matched_product,matched_terms,status,source,imported_at)
@@ -127,63 +90,92 @@ def save_posts(rows, products, keywords, hashtags):
     conn.close()
     return added
 
-def load_posts():
-    conn = connect_db()
-    df = pd.read_sql_query("SELECT * FROM posts ORDER BY created_at DESC", conn)
-    conn.close()
-    return df
-
 st.title("🌷 TrendWatch X")
-st.caption("Pemantau hashtag dan peluang produk · sumber live hanya jika X API berhasil diakses")
+st.caption("Dashboard riset tren dari teks postingan publik yang kamu masukkan sendiri — tanpa X API dan tanpa biaya API.")
 
 with st.sidebar:
     st.header("Pengaturan pantauan")
     products_raw = st.text_area("Produk (pisahkan dengan koma)", DEFAULT_PRODUCTS, height=90)
     keywords_raw = st.text_area("Kata kunci minat (pisahkan dengan koma)", DEFAULT_KEYWORDS, height=100)
     hashtags_raw = st.text_area("Hashtag tanpa # (pisahkan dengan koma)", DEFAULT_HASHTAGS, height=80)
-    query = st.text_input("Query X API", '(("butuh" OR "cari" OR "WTB") (Netflix OR Canva OR Spotify)) lang:id -is:retweet')
-    limit = st.select_slider("Maksimum hasil per pengambilan", options=[10,20,30,50,100], value=20)
     st.divider()
-    st.markdown("**Sumber:** X API resmi saja. Tidak ada data demo yang otomatis dicampur dengan data live.")
+    st.caption("Analisis dilakukan pada data yang kamu masukkan. Dashboard tidak mengambil postingan otomatis dari X.")
 
 products = comma_list(products_raw)
 keywords = comma_list(keywords_raw)
 hashtags = comma_list(hashtags_raw)
 
-col1, col2 = st.columns([1, 1])
-with col1:
-    if st.button("🔎 Ambil postingan dari X", use_container_width=True, type="primary"):
-        try:
-            with st.spinner("Menghubungi X API..."):
-                rows = fetch_x(query, limit)
-                added = save_posts(rows, products, keywords, hashtags)
-            st.success(f"Pengambilan selesai. Hasil dari API: {len(rows)}; postingan baru disimpan: {added}.")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
-with col2:
-    if st.button("↻ Muat ulang dashboard", use_container_width=True):
+st.subheader("Tambah data postingan")
+st.write("Salin teks postingan publik yang ingin dianalisis, lalu tempelkan di bawah. Pisahkan setiap postingan dengan satu baris kosong.")
+with st.form("manual_import"):
+    pasted = st.text_area("Teks postingan", height=180, placeholder="Contoh: Lagi cari akun Canva Pro yang aman, ada rekomendasi?\n\nButuh rekomendasi aplikasi edit video selain CapCut.")
+    username = st.text_input("Nama akun (opsional)", placeholder="@nama_akun")
+    submitted = st.form_submit_button("✨ Analisis dan simpan postingan", use_container_width=True)
+if submitted:
+    blocks = [x.strip() for x in re.split(r"\n\s*\n", pasted) if x.strip()]
+    if not blocks:
+        st.warning("Tempelkan setidaknya satu teks postingan terlebih dahulu.")
+    else:
+        rows = [{"text": block, "username": username or "Input manual"} for block in blocks]
+        added = save_posts(rows, products, keywords, hashtags)
+        st.success(f"Selesai! {len(blocks)} teks diproses; {added} data baru disimpan.")
         st.rerun()
 
+with st.expander("Impor banyak data dari CSV"):
+    st.caption("CSV minimal harus memiliki kolom `text`. Kolom opsional: username, created_at, likes, reposts, replies, post_id.")
+    uploaded = st.file_uploader("Pilih file CSV", type=["csv"])
+    if uploaded is not None:
+        try:
+            csv_df = pd.read_csv(uploaded).fillna("")
+            if "text" not in csv_df.columns:
+                st.error("CSV harus memiliki kolom bernama text.")
+            else:
+                st.dataframe(csv_df.head(5), use_container_width=True)
+                if st.button("Impor CSV ini"):
+                    rows = csv_df.to_dict(orient="records")
+                    added = save_posts(rows, products, keywords, hashtags, source="Impor CSV")
+                    st.success(f"{added} data baru berhasil disimpan.")
+                    st.rerun()
+        except Exception as exc:
+            st.error(f"CSV tidak dapat dibaca: {exc}")
+
+st.divider()
 df = load_posts()
 if df.empty:
-    st.info("Belum ada postingan live tersimpan. Atur token X API dan tekan 'Ambil postingan dari X'. Dashboard tidak akan menampilkan data contoh sebagai data asli.")
+    st.info("Belum ada data. Tambahkan teks postingan di atas atau impor file CSV untuk mulai melihat analisis.")
 else:
     total = len(df)
     new_count = int((df["status"] == "Baru").sum())
     tracked_products = int(df["matched_product"].fillna("").ne("").sum())
+    likes_total = int(pd.to_numeric(df["likes"], errors="coerce").fillna(0).sum())
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("Postingan tersimpan", total)
-    c2.metric("Peluang baru", new_count)
+    c2.metric("Peluang terdeteksi", new_count)
     c3.metric("Cocok produk", tracked_products)
-    c4.metric("Total likes", int(pd.to_numeric(df["likes"], errors="coerce").fillna(0).sum()))
+    c4.metric("Total likes (jika diisi)", likes_total)
 
-    st.subheader("Filter postingan")
+    st.subheader("Kata kunci yang sering muncul")
+    term_counts = Counter()
+    for _, row in df.iterrows():
+        term_counts.update([x.strip() for x in str(row["matched_terms"]).split(",") if x.strip()])
+    if term_counts:
+        st.bar_chart(pd.DataFrame(term_counts.most_common(12), columns=["Kata kunci", "Jumlah"]).set_index("Kata kunci"))
+    else:
+        st.caption("Belum ada kata kunci pantauan yang cocok. Kamu bisa menambah kata di pengaturan sebelah kiri.")
+
+    product_counts = Counter()
+    for value in df["matched_product"].fillna(""):
+        product_counts.update([x.strip() for x in value.split(",") if x.strip()])
+    if product_counts:
+        st.subheader("Produk yang sering disebut")
+        st.bar_chart(pd.DataFrame(product_counts.most_common(10), columns=["Produk", "Jumlah"]).set_index("Produk"))
+
+    st.subheader("Filter data")
     f1,f2,f3 = st.columns([2,1,1])
     with f1:
         search = st.text_input("Cari teks, akun, atau produk", "")
     with f2:
-        status_filter = st.selectbox("Status", ["Semua","Baru","Ditindaklanjuti","Selesai","Perlu ditinjau"])
+        status_filter = st.selectbox("Status", ["Semua"] + STATUSES)
     with f3:
         product_options = ["Semua"] + sorted([p for p in df["matched_product"].dropna().unique() if p])
         product_filter = st.selectbox("Produk", product_options)
@@ -206,29 +198,22 @@ else:
             if row.get("matched_terms"): tags.append("Cocok: " + row["matched_terms"])
             if tags: st.caption(" · ".join(tags))
             st.caption(f"Likes {row['likes']} · Repost {row['reposts']} · Balasan {row['replies']} · Sumber: {row['source']}")
-            current_status = row["status"] if row["status"] in ["Baru","Ditindaklanjuti","Selesai","Perlu ditinjau"] else "Perlu ditinjau"
-            new_status = st.selectbox("Status", ["Baru","Ditindaklanjuti","Selesai","Perlu ditinjau"], index=["Baru","Ditindaklanjuti","Selesai","Perlu ditinjau"].index(current_status), key=f"status_{row['post_id']}")
+            current_status = row["status"] if row["status"] in STATUSES else "Perlu ditinjau"
+            new_status = st.selectbox("Status", STATUSES, index=STATUSES.index(current_status), key=f"status_{row['post_id']}")
             if new_status != current_status and st.button("Simpan status", key=f"save_{row['post_id']}"):
                 conn = connect_db()
                 conn.execute("UPDATE posts SET status=? WHERE post_id=?", (new_status, row["post_id"]))
                 conn.commit(); conn.close()
                 st.rerun()
 
-    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ Ekspor semua data ke CSV", csv_bytes, "trendwatch_x_posts.csv", "text/csv")
-    counts = Counter()
-    for text_value in df["text"].fillna(""):
-        counts.update("#" + tag for tag in re.findall(r"(?<!\\w)#([\\w]+)", text_value))
-    if counts:
-        st.subheader("Hashtag yang ditemukan")
-        st.bar_chart(pd.DataFrame(counts.most_common(12), columns=["Hashtag","Jumlah"]).set_index("Hashtag"))
+    st.download_button("⬇️ Ekspor semua data ke CSV", df.to_csv(index=False).encode("utf-8-sig"), "trendwatch_x_data.csv", "text/csv")
 
 with st.expander("Cara kerja dan batasan"):
     st.markdown("""
-- Data hanya disimpan setelah berhasil diambil dari X API resmi; dashboard tidak membuat data live palsu.
-- Penyimpanan SQLite memakai `post_id` sebagai kunci unik sehingga hasil yang sama tidak disimpan dua kali.
-- Penyaringan peluang memakai pencocokan kata sederhana. Hasil perlu ditinjau manusia; ini bukan bukti pasti seseorang berniat membeli.
-- Tombol pengambilan melakukan satu kali permintaan. Untuk otomatis berkala 24/7, aplikasi perlu dijalankan di hosting dengan scheduler/worker; refresh halaman saja tidak menjamin pengambilan data baru.
-- Endpoint recent search, kuota, harga, dan periode data bergantung pada akses X API akunmu. HTTP 403 dapat berarti paket tidak memiliki akses.
-- Hormati aturan platform dan privasi. Jangan memakai cara yang melewati login atau pembatasan akses.
+- Versi ini tidak terhubung ke X API, tidak meminta Bearer Token, dan tidak melakukan scraping.
+- Kamu memasukkan sendiri teks postingan publik yang ingin dianalisis, atau mengimpor CSV.
+- Analisis mencocokkan nama produk, kata kunci minat, dan hashtag berdasarkan daftar di sidebar.
+- Label peluang adalah petunjuk untuk ditinjau, bukan bukti pasti seseorang akan membeli.
+- Pastikan penggunaan data menghormati aturan platform dan privasi. Jangan masukkan informasi pribadi atau postingan privat.
+- Penyimpanan menggunakan SQLite pada lingkungan hosting. Pada layanan hosting gratis, data lokal dapat memiliki batas persistensi; unduh CSV secara berkala sebagai cadangan.
 """)
